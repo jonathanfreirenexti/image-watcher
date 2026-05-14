@@ -57,12 +57,15 @@ const server = createServer((req, res) => {
   res.end('image-watcher ok');
 });
 
-const wss = new WebSocketServer({
-  server,
-  verifyClient: ({ origin }) => ALLOWED_ORIGIN === '*' || origin === ALLOWED_ORIGIN,
-});
+const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  const origin = req.headers.origin ?? '(no origin)';
+  const ip = req.socket.remoteAddress ?? 'unknown';
+  console.log(`[ws] client connected — origin: ${origin}  ip: ${ip}`);
+
+  // Immediate handshake so client knows the channel is alive
+  send(ws, { type: 'ready', message: 'image-watcher connected' });
   let ssh = null;
   let sftp = null;
   let timer = null;
@@ -147,10 +150,13 @@ wss.on('connection', (ws) => {
       }
 
       if (!SSH_HOST || !SSH_USER || (!SSH_PASSWORD && !SSH_PRIVATE_KEY)) {
-        send(ws, { type: 'error', message: 'SSH credentials not configured on server' });
+        const missing = [!SSH_HOST && 'SSH_HOST', !SSH_USER && 'SSH_USER', !SSH_PASSWORD && !SSH_PRIVATE_KEY && 'SSH_PASSWORD/SSH_PRIVATE_KEY'].filter(Boolean).join(', ');
+        console.error(`[ws] missing env vars: ${missing}`);
+        send(ws, { type: 'error', message: `SSH credentials not configured on server. Missing: ${missing}` });
         return;
       }
 
+      console.log(`[ws] starting SSH → ${SSH_USER}@${SSH_HOST}:${SSH_PORT}  path: ${watchPath}`);
       watching = true;
       seenFiles = new Set();
       ssh = new Client();
@@ -163,12 +169,15 @@ wss.on('connection', (ws) => {
       }
 
       ssh.on('ready', () => {
+        console.log(`[ssh] connected to ${SSH_HOST}`);
         send(ws, { type: 'connected', message: `SSH connected. Watching ${watchPath}` });
         ssh.sftp((err, _sftp) => {
           if (err) {
+            console.error(`[sftp] init failed: ${err.message}`);
             send(ws, { type: 'error', message: `SFTP init failed: ${err.message}` });
             cleanup(); return;
           }
+          console.log(`[sftp] session open, polling every ${POLL_INTERVAL_MS}ms`);
           sftp = _sftp;
           checkFolder(watchPath);
           timer = setInterval(() => checkFolder(watchPath), POLL_INTERVAL_MS);
@@ -176,6 +185,7 @@ wss.on('connection', (ws) => {
       });
 
       ssh.on('error', (err) => {
+        console.error(`[ssh] error: ${err.message}`);
         send(ws, { type: 'error', message: `SSH error: ${err.message}` });
         cleanup();
       });
