@@ -25,8 +25,10 @@ function send(ws, payload) {
 }
 
 function isRegularFile(attrs) {
-  // POSIX mode bit 0o100000 = regular file
-  return attrs && (attrs.mode & 0o170000) === 0o100000;
+  // If mode is missing or 0 (some SFTP servers omit it), fall back to true —
+  // the extension filter already excludes directories named like "foo.jpg".
+  if (!attrs || !attrs.mode) return true;
+  return (attrs.mode & 0o170000) === 0o100000;
 }
 
 function safePath(requestedPath) {
@@ -74,21 +76,39 @@ wss.on('connection', (ws) => {
     if (ssh) { try { ssh.end(); } catch (_) {} ssh = null; }
   }
 
+  let pollCount = 0;
+
   async function checkFolder(watchPath) {
     if (!sftp || !watching) return;
     sftp.readdir(watchPath, async (err, list) => {
       if (err) { send(ws, { type: 'error', message: `readdir: ${err.message}` }); return; }
 
-      const newImages = list.filter((entry) => {
+      pollCount++;
+      const allFiles = list.map((e) => e.filename);
+      const imageFiles = list.filter((entry) => {
         const ext = getExt(entry.filename);
-        return IMAGE_EXTS.has(ext) && isRegularFile(entry.attrs) && !seenFiles.has(entry.filename);
+        return IMAGE_EXTS.has(ext) && isRegularFile(entry.attrs);
       });
+      const newImages = imageFiles.filter((entry) => !seenFiles.has(entry.filename));
+
+      // Every 5 polls send a scan heartbeat so clients can verify the watcher is alive
+      if (pollCount % 5 === 1) {
+        send(ws, {
+          type: 'scan',
+          poll: pollCount,
+          totalFiles: allFiles.length,
+          imageFiles: imageFiles.length,
+          newImages: newImages.length,
+          seenSoFar: seenFiles.size,
+          files: allFiles,
+        });
+      }
 
       for (const entry of newImages) {
         seenFiles.add(entry.filename);
         const filePath = `${watchPath}/${entry.filename}`;
         try {
-          // Small delay — let external service finish writing the file
+          // Small delay — let the external service finish writing before reading
           await new Promise((r) => setTimeout(r, 500));
           const base64 = await readFileAsBase64(sftp, filePath);
           const rawExt = getExt(entry.filename).slice(1);
